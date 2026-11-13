@@ -1,10 +1,18 @@
 {
-  "MUBARAK/USDT": {
-    "direction": "LONG",
+  "POPCAT/USDT": {
+    "symbol": "POPCAT/USDT",
+    "exchange": "okx",
+    "direction": "SHORT",
+    "rsi": 77.7777293827463,
     "confidence": 0.75,
+    "price": 0.03238,
+    "sl": 0.03294095,
+    "tp1": 0.03148248,
+    "tp2": 0.03092152,
+    "tp3": 0.03024838,
+    "leverage": "۱۰x – ۲۰x",
+    "ts": "2026-11-13T18:57:11.046684+00:00",
     "count": 1,
-    "exchange": "mexc",
-    "price": 0.03417,
-    "last_seen": "2026-11-13T10:19:01.937024+00:00"
+    "last_seen": "2026-11-13T18:57:11.046684+00:00"
   }
 }
