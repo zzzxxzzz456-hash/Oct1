@@ -654,7 +654,7 @@ async def scan_market_single_run():
             prev_signals[sym] = {**cur, 'count': 1, 'last_seen': cur['ts']}
 
     for sym, data in prev_signals.items():
-        if sym in current_map and data.get('count', 0) >= 1:
+        if sym in current_map and data.get('count', 0) >= 2:
             confirmed_list.append({
                 'symbol': sym,
                 'exchange': data['exchange'],
