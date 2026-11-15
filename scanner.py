@@ -1,24 +1,22 @@
 """
-GitHub Actions Trading Scanner - Enhanced Version v3.1
-Changelog v3.1:
-  - FIX: Volume filter now uses LAST CLOSED candle (-2) instead of forming candle (-1)
-  - FIX: Reduced MIN_VOLUME_MULT to 1.0 and MIN_ADX to 18 for more signals
-  - ADD: MAX_TP3_RR cap (6.0) to prevent unrealistic TP3 targets (e.g. 13x)
-  - ADD: Stricter leverage caps (15x max at low risk) to prevent dangerous 30x
-  - FIX: Telegram R:R computation now displays accurate values
-  - ADD: CCXT upgrade hint in requirements comment
-Base features (v3.0):
+GitHub Actions Trading Scanner - Enhanced Version v3.3
+Changelog v3.3:
+  - REMOVED: Two-stage confirmation (count >= 2). Signals are now sent IMMEDIATELY on first detection.
+  - MODIFIED: prev_signals is now used only for deduplication (cooldown) not for confirmation.
+  - KEPT: All v3.2 features (HTF gate, ADX, Volume fix, calibrated kNN, feedback loop, early-break, TP3 cap, safer leverage)
+Base features:
   - HTF Trend Gate (1h EMA50 direction filter)
   - ADX regime filter
   - Distance-weighted kNN + softmax calibration
-  - Volume filter (fixed)
+  - Volume filter
   - Feedback loop (resolve outcomes + auto-tune)
-  - Per-symbol cooldown
-  - Count >= 2 confirmation
+  - Per-symbol cooldown (prevents repeated alerts)
   - Min R:R = 1:1.8 (hard reject)
   - Min S/R distance = max(0.6% price, 0.8*ATR)
-  - 3 TPs on real S/R
+  - 3 TPs on real S/R with MAX_TP3_RR cap
+  - Safer leverage caps
   - Trailing TP guidance in Persian message
+  - Early break: skip remaining exchanges once a signal is found
 """
 
 import asyncio
@@ -55,8 +53,6 @@ COIN_LIST = [
     'SLERF/USDT','DEGEN/USDT','1000PEPE/USDT'
 ]
 
-# Removed 'gateio' and 'huobi' to avoid async ccxt attribute errors on older versions.
-# If your ccxt version supports them, add them back.
 EXCHANGE_ORDER = ['binance','bybit','kucoin','mexc','okx','bitget']
 SR_TIMEFRAMES = ['1d', '4h', '1h', '15m', '5m']
 TIMEFRAME_WEIGHTS = {'1d':5,'4h':3,'1h':2,'15m':1.5,'5m':1}
@@ -75,7 +71,7 @@ DEFAULT_TUNING = {
     'MIN_RR': 1.8,
     'MIN_CONFIDENCE': 0.62,
     'MIN_ADX': 18.0,
-    'MIN_VOLUME_MULT': 1.0,
+    'MIN_VOLUME_MULT': 0.8,
     'MIN_SL_PCT': 0.012,
     'MIN_SR_DISTANCE_PCT': 0.006,
     'MIN_SR_DISTANCE_ATR_MULT': 0.8,
@@ -85,11 +81,11 @@ DEFAULT_TUNING = {
 HTF_TIMEFRAME = '1h'
 HTF_EMA_PERIOD = 50
 
-# ---- Confirmation / dedup ----
-SIGNAL_STALE_MINUTES = 30
+# ---- Dedup / cooldown ----
+# Cooldown prevents the same symbol from being alerted again within this window.
 ALERT_COOLDOWN_MINUTES = 120
 MAX_LEVERAGE_RISK_PCT = 4.5
-MAX_TP3_RR = 6.0   # cap TP3 at 6x risk (prevents unrealistic 13x targets)
+MAX_TP3_RR = 6.0
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -209,43 +205,39 @@ def format_price(price):
         return f"{price:.4f}"
 
 
-async def format_and_send_signals(confirmed_list):
-    if not confirmed_list:
-        return
+async def format_and_send_signal(signal):
+    direction = signal['direction']
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    dir_text = "لانگ (خرید)" if direction == "LONG" else "شورت (فروش)"
 
-    for signal in confirmed_list:
-        direction = signal['direction']
-        emoji = "🟢" if direction == "LONG" else "🔴"
-        dir_text = "لانگ (خرید)" if direction == "LONG" else "شورت (فروش)"
+    entry = signal['price']
+    sl = signal.get('sl', 0)
+    tp1 = signal.get('tp1', 0)
+    tp2 = signal.get('tp2', 0)
+    tp3 = signal.get('tp3', 0)
+    leverage = signal.get('leverage', '۵x - ۱۰x')
 
-        entry = signal['price']
-        sl = signal.get('sl', 0)
-        tp1 = signal.get('tp1', 0)
-        tp2 = signal.get('tp2', 0)
-        tp3 = signal.get('tp3', 0)
-        leverage = signal.get('leverage', '۵x - ۱۰x')
+    if direction == "LONG":
+        risk_pct = ((entry - sl) / entry) * 100 if entry else 0
+        rr1 = (tp1 - entry) / (entry - sl) if (entry - sl) > 0 else 0
+        rr2 = (tp2 - entry) / (entry - sl) if (entry - sl) > 0 else 0
+        rr3 = (tp3 - entry) / (entry - sl) if (entry - sl) > 0 else 0
+        tp1_pct = ((tp1 - entry) / entry) * 100 if entry else 0
+        tp2_pct = ((tp2 - entry) / entry) * 100 if entry else 0
+        tp3_pct = ((tp3 - entry) / entry) * 100 if entry else 0
+    else:
+        risk_pct = ((sl - entry) / entry) * 100 if entry else 0
+        rr1 = (entry - tp1) / (sl - entry) if (sl - entry) > 0 else 0
+        rr2 = (entry - tp2) / (sl - entry) if (sl - entry) > 0 else 0
+        rr3 = (entry - tp3) / (sl - entry) if (sl - entry) > 0 else 0
+        tp1_pct = ((entry - tp1) / entry) * 100 if entry else 0
+        tp2_pct = ((entry - tp2) / entry) * 100 if entry else 0
+        tp3_pct = ((entry - tp3) / entry) * 100 if entry else 0
 
-        if direction == "LONG":
-            risk_pct = ((entry - sl) / entry) * 100 if entry else 0
-            rr1 = (tp1 - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            rr2 = (tp2 - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            rr3 = (tp3 - entry) / (entry - sl) if (entry - sl) > 0 else 0
-            tp1_pct = ((tp1 - entry) / entry) * 100 if entry else 0
-            tp2_pct = ((tp2 - entry) / entry) * 100 if entry else 0
-            tp3_pct = ((tp3 - entry) / entry) * 100 if entry else 0
-        else:
-            risk_pct = ((sl - entry) / entry) * 100 if entry else 0
-            rr1 = (entry - tp1) / (sl - entry) if (sl - entry) > 0 else 0
-            rr2 = (entry - tp2) / (sl - entry) if (sl - entry) > 0 else 0
-            rr3 = (entry - tp3) / (sl - entry) if (sl - entry) > 0 else 0
-            tp1_pct = ((entry - tp1) / entry) * 100 if entry else 0
-            tp2_pct = ((entry - tp2) / entry) * 100 if entry else 0
-            tp3_pct = ((entry - tp3) / entry) * 100 if entry else 0
+    htf_txt = "موافق" if signal.get('htf_ok') else "—"
 
-        htf_txt = "موافق" if signal.get('htf_ok') else "—"
-
-        message = f"""
-{emoji} <b>سیگنال تأیید شده</b> {emoji}
+    message = f"""
+{emoji} <b>سیگنال جدید</b> {emoji}
 
 📌 <b>{signal['symbol']}</b>
 📍 جهت: <b>{dir_text}</b>
@@ -271,7 +263,6 @@ async def format_and_send_signals(confirmed_list):
 📉 RSI: {signal['rsi']:.1f}
 📈 ADX: {signal.get('adx', 0):.1f}
 🧭 روند HTF: {htf_txt}
-🔄 تعداد تأیید: {signal['count']}
 
 📋 <b>مدیریت پوزیشن (Trailing):</b>
 • پس از TP1 → حد ضرر را به نقطه ورود منتقل کنید
@@ -280,7 +271,7 @@ async def format_and_send_signals(confirmed_list):
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d  %H:%M')} UTC
 """
-        await send_telegram_message(message.strip())
+    await send_telegram_message(message.strip())
 
 
 # ---------------- Persistence ----------------
@@ -312,7 +303,7 @@ async def append_csv_row(path, header, row):
         logger.error(f"CSV {path} error: {e}")
 
 
-SIGNAL_HEADER = ['datetime_utc','symbol','direction','exchange','confidence','price','rsi','adx','count','sl','tp1','tp2','tp3','leverage','htf_ok']
+SIGNAL_HEADER = ['datetime_utc','symbol','direction','exchange','confidence','price','rsi','adx','sl','tp1','tp2','tp3','leverage','htf_ok']
 OUTCOME_HEADER = ['signal_id','datetime_utc','symbol','direction','entry','sl','tp1','tp2','tp3','outcome','exit_price','resolved_at_utc']
 
 
@@ -516,16 +507,20 @@ async def check_htf_trend(exchange, symbol, direction):
         return last_close < ema
 
 
-# ---- Volume filter (FIXED: uses last CLOSED candle -2, not forming candle -1) ----
+# ---- Volume filter (Robust version) ----
 def check_volume(df, lookback=20, mult=None):
     if df is None or len(df) < lookback + 2:
         return False
     mult = mult if mult is not None else TUNING['MIN_VOLUME_MULT']
-    # Use last CLOSED candle (index -2) vs average of 20 fully-closed candles before it
-    avg = df['volume'].iloc[-lookback-2:-2].mean()
+    recent_volumes = df['volume'].iloc[-lookback-2:-2]
+    avg = recent_volumes.mean()
+    # If data is broken (avg zero), don't block the signal
     if avg <= 0:
+        return True
+    last_closed_vol = df['volume'].iloc[-2]
+    if last_closed_vol == 0:
         return False
-    return df['volume'].iloc[-2] >= avg * mult
+    return last_closed_vol >= (avg * mult)
 
 
 def _round_price(p, ref_price):
@@ -563,7 +558,6 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
         valid_r3 = [r for r in valid_r2 if (r - price) / risk >= (min_rr + 2.0)]
         tp3 = valid_r3[0] if valid_r3 else max(atr_tp3, tp2 + 1.1 * risk)
 
-        # Cap TP3 at MAX_TP3_RR to avoid unrealistic targets
         tp3 = min(tp3, price + MAX_TP3_RR * risk)
 
         if (tp1 - price) / risk < min_rr - 1e-9:
@@ -592,7 +586,6 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
         valid_s3 = [s for s in valid_s2 if (price - s) / risk >= (min_rr + 2.0)]
         tp3 = valid_s3[0] if valid_s3 else min(atr_tp3, tp2 - 1.1 * risk)
 
-        # Cap TP3 at MAX_TP3_RR
         tp3 = max(tp3, price - MAX_TP3_RR * risk)
 
         if (price - tp1) / risk < min_rr - 1e-9:
@@ -603,7 +596,6 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
     tp2 = _round_price(tp2, price)
     tp3 = _round_price(tp3, price)
 
-    # Stricter leverage caps to prevent dangerous 30x at tiny SL
     risk_pct = abs(price - sl) / price * 100
     if risk_pct < 1.5:
         leverage = "۱۰x – ۱۵x"
@@ -874,16 +866,6 @@ def _pick_supported_timeframe(exchange):
     return '15m'
 
 
-def _is_signal_stale(last_seen_iso: str, minutes: int) -> bool:
-    try:
-        last = datetime.fromisoformat(last_seen_iso)
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - last).total_seconds() > minutes * 60
-    except:
-        return True
-
-
 def _is_in_cooldown(sym, cooldown_minutes):
     prev = prev_signals.get(sym, {})
     last_alert = prev.get('last_alert')
@@ -899,16 +881,19 @@ def _is_in_cooldown(sym, cooldown_minutes):
 
 
 async def scan_market_single_run():
-    logger.info(f"Starting market scan (v3.1) | TUNING={TUNING}")
+    logger.info(f"Starting market scan (v3.3) | TUNING={TUNING}")
     sr_cache.clear()
     for eid, ex in exchanges.items():
         await _ensure_swap_options(ex, eid)
 
-    current_map = {}
     confirmed_list = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    found_in_this_run = set()
 
     for i, requested_symbol in enumerate(COIN_LIST):
+        if requested_symbol in found_in_this_run:
+            continue
+
         logger.info(f"Processing {requested_symbol} ({i+1}/{len(COIN_LIST)})")
         for eid in EXCHANGE_ORDER:
             exchange = exchanges.get(eid)
@@ -973,7 +958,13 @@ async def scan_market_single_run():
 
             sl, tp1, tp2, tp3, leverage = result
 
-            current_map[requested_symbol] = {
+            # Cooldown check per symbol
+            if _is_in_cooldown(requested_symbol, ALERT_COOLDOWN_MINUTES):
+                logger.info(f"  Cooldown active for {requested_symbol}, skipping alert")
+                found_in_this_run.add(requested_symbol)
+                break
+
+            signal_data = {
                 'symbol': requested_symbol,
                 'exchange': eid,
                 'direction': signal_type,
@@ -988,77 +979,41 @@ async def scan_market_single_run():
                 'leverage': leverage,
                 'atr': atr,
                 'htf_ok': True,
-                'ts': now_iso
             }
-            logger.info(f"Signal found: {requested_symbol} {signal_type} conf={confidence:.2f} adx={current_adx:.1f}")
-            break
+
+            logger.info(f"Signal confirmed & sent: {requested_symbol} {signal_type} conf={confidence:.2f} adx={current_adx:.1f}")
+
+            # Send IMMEDIATELY
+            await format_and_send_signal(signal_data)
+            await append_csv_row(CSV_LOG_PATH, SIGNAL_HEADER, {
+                'datetime_utc': now_iso,
+                'symbol': requested_symbol,
+                'direction': signal_type,
+                'exchange': eid,
+                'confidence': confidence,
+                'price': current_price,
+                'rsi': current_rsi,
+                'adx': current_adx,
+                'sl': sl,
+                'tp1': tp1,
+                'tp2': tp2,
+                'tp3': tp3,
+                'leverage': leverage,
+                'htf_ok': True,
+            })
+
+            confirmed_list.append(signal_data)
+            found_in_this_run.add(requested_symbol)
+
+            # Save cooldown marker in prev_signals
+            prev_signals[requested_symbol] = {**signal_data, 'last_alert': now_iso}
+
+            break  # Move to next coin immediately
         await asyncio.sleep(0.08)
-
-    alerts_to_send = []
-    for sym, cur in current_map.items():
-        prev = prev_signals.get(sym)
-        if prev and prev.get('direction') == cur['direction'] and not _is_signal_stale(prev.get('last_seen', ''), SIGNAL_STALE_MINUTES):
-            new_count = prev.get('count', 1) + 1
-            prev_signals[sym] = {**cur, 'count': new_count, 'last_seen': cur['ts'], 'last_alert': prev.get('last_alert')}
-        else:
-            prev_signals[sym] = {**cur, 'count': 1, 'last_seen': cur['ts'], 'last_alert': (prev or {}).get('last_alert')}
-
-    for sym, cur in current_map.items():
-        data = prev_signals.get(sym)
-        if not data or data.get('count', 0) < 2:
-            continue
-        if _is_in_cooldown(sym, ALERT_COOLDOWN_MINUTES):
-            logger.info(f"  Cooldown active for {sym}, skipping alert")
-            continue
-
-        confirmed_list.append({
-            'symbol': sym,
-            'exchange': data['exchange'],
-            'direction': data['direction'],
-            'rsi': data.get('rsi', 50),
-            'adx': data.get('adx', 0),
-            'confidence': data['confidence'],
-            'price': data['price'],
-            'sl': data.get('sl'),
-            'tp1': data.get('tp1'),
-            'tp2': data.get('tp2'),
-            'tp3': data.get('tp3'),
-            'leverage': data.get('leverage', '۵x - ۱۰x'),
-            'atr': data.get('atr', 0),
-            'htf_ok': data.get('htf_ok', False),
-            'count': data['count']
-        })
-        prev_signals[sym]['last_alert'] = now_iso
-
-        await append_csv_row(CSV_LOG_PATH, SIGNAL_HEADER, {
-            'datetime_utc': now_iso,
-            'symbol': sym,
-            'direction': data['direction'],
-            'exchange': data['exchange'],
-            'confidence': data['confidence'],
-            'price': data['price'],
-            'rsi': data.get('rsi', ''),
-            'adx': data.get('adx', ''),
-            'count': data['count'],
-            'sl': data.get('sl', ''),
-            'tp1': data.get('tp1', ''),
-            'tp2': data.get('tp2', ''),
-            'tp3': data.get('tp3', ''),
-            'leverage': data.get('leverage', ''),
-            'htf_ok': data.get('htf_ok', False),
-        })
-
-    for s in list(prev_signals.keys()):
-        if s not in current_map:
-            prev_signals.pop(s, None)
-        elif _is_signal_stale(prev_signals[s].get('last_seen', ''), SIGNAL_STALE_MINUTES):
-            prev_signals.pop(s, None)
 
     await save_prev_signals()
 
-    if confirmed_list:
-        await format_and_send_signals(confirmed_list)
-    else:
+    if not confirmed_list:
         logger.info("No confirmed signals")
 
     return confirmed_list
@@ -1068,7 +1023,7 @@ async def main():
     try:
         start_time = time.time()
         logger.info("=" * 50)
-        logger.info("SCANNER v3.1 — Volume fix + TP3 cap + safer leverage")
+        logger.info("SCANNER v3.3 — Single-pass confirmation (send on first signal)")
         await load_tuning()
         await load_prev_signals()
         await init_exchanges()
