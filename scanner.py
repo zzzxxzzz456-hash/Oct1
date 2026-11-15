@@ -1,16 +1,19 @@
 """
-GitHub Actions Trading Scanner - Enhanced Version v3.3
-Changelog v3.3:
-  - REMOVED: Two-stage confirmation (count >= 2). Signals are now sent IMMEDIATELY on first detection.
-  - MODIFIED: prev_signals is now used only for deduplication (cooldown) not for confirmation.
-  - KEPT: All v3.2 features (HTF gate, ADX, Volume fix, calibrated kNN, feedback loop, early-break, TP3 cap, safer leverage)
+GitHub Actions Trading Scanner - Enhanced Version v3.4
+Changelog v3.4 (Short Squeeze Protection):
+  - ADD: Funding Rate filter (reject SHORT if funding rate < -0.03%)
+  - ADD: Dynamic ADX threshold (SHORT needs ADX >= 28, LONG >= 18)
+  - ADD: Recent pump filter (reject SHORT if price pumped > 3% in last 3 candles)
+  - ADD: Emergency switch DISABLE_SHORTS flag (set True to disable all shorts)
+  - KEPT: All v3.3 features (single-pass confirmation, HTF gate, volume fix, calibrated kNN, cooldown, feedback loop, TP3 cap, safer leverage)
 Base features:
   - HTF Trend Gate (1h EMA50 direction filter)
-  - ADX regime filter
+  - ADX regime filter (dynamic by direction)
   - Distance-weighted kNN + softmax calibration
-  - Volume filter
+  - Volume filter (robust)
   - Feedback loop (resolve outcomes + auto-tune)
   - Per-symbol cooldown (prevents repeated alerts)
+  - Single-pass confirmation (send on first signal)
   - Min R:R = 1:1.8 (hard reject)
   - Min S/R distance = max(0.6% price, 0.8*ATR)
   - 3 TPs on real S/R with MAX_TP3_RR cap
@@ -70,19 +73,25 @@ TUNE_PATH = 'tuner_state.json'
 DEFAULT_TUNING = {
     'MIN_RR': 1.8,
     'MIN_CONFIDENCE': 0.62,
-    'MIN_ADX': 18.0,
+    'MIN_ADX_LONG': 18.0,
+    'MIN_ADX_SHORT': 28.0,       # stricter ADX for shorts
     'MIN_VOLUME_MULT': 0.8,
     'MIN_SL_PCT': 0.012,
     'MIN_SR_DISTANCE_PCT': 0.006,
     'MIN_SR_DISTANCE_ATR_MULT': 0.8,
 }
 
+# ---- Short-squeeze protection ----
+FUNDING_RATE_MIN = -0.0003          # reject SHORT if funding < -0.03%
+RECENT_PUMP_LOOKBACK = 3            # candles
+RECENT_PUMP_THRESHOLD = 0.03        # 3% rise
+DISABLE_SHORTS = False              # emergency switch — set True to send only LONGs
+
 # ---- HTF trend gate ----
 HTF_TIMEFRAME = '1h'
 HTF_EMA_PERIOD = 50
 
 # ---- Dedup / cooldown ----
-# Cooldown prevents the same symbol from being alerted again within this window.
 ALERT_COOLDOWN_MINUTES = 120
 MAX_LEVERAGE_RISK_PCT = 4.5
 MAX_TP3_RR = 6.0
@@ -235,6 +244,7 @@ async def format_and_send_signal(signal):
         tp3_pct = ((entry - tp3) / entry) * 100 if entry else 0
 
     htf_txt = "موافق" if signal.get('htf_ok') else "—"
+    funding_txt = f"{signal.get('funding_rate', 0)*100:+.3f}٪" if signal.get('funding_rate') is not None else "—"
 
     message = f"""
 {emoji} <b>سیگنال جدید</b> {emoji}
@@ -263,6 +273,7 @@ async def format_and_send_signal(signal):
 📉 RSI: {signal['rsi']:.1f}
 📈 ADX: {signal.get('adx', 0):.1f}
 🧭 روند HTF: {htf_txt}
+💸 Funding: {funding_txt}
 
 📋 <b>مدیریت پوزیشن (Trailing):</b>
 • پس از TP1 → حد ضرر را به نقطه ورود منتقل کنید
@@ -303,7 +314,7 @@ async def append_csv_row(path, header, row):
         logger.error(f"CSV {path} error: {e}")
 
 
-SIGNAL_HEADER = ['datetime_utc','symbol','direction','exchange','confidence','price','rsi','adx','sl','tp1','tp2','tp3','leverage','htf_ok']
+SIGNAL_HEADER = ['datetime_utc','symbol','direction','exchange','confidence','price','rsi','adx','sl','tp1','tp2','tp3','leverage','htf_ok','funding_rate']
 OUTCOME_HEADER = ['signal_id','datetime_utc','symbol','direction','entry','sl','tp1','tp2','tp3','outcome','exit_price','resolved_at_utc']
 
 
@@ -514,13 +525,52 @@ def check_volume(df, lookback=20, mult=None):
     mult = mult if mult is not None else TUNING['MIN_VOLUME_MULT']
     recent_volumes = df['volume'].iloc[-lookback-2:-2]
     avg = recent_volumes.mean()
-    # If data is broken (avg zero), don't block the signal
     if avg <= 0:
         return True
     last_closed_vol = df['volume'].iloc[-2]
     if last_closed_vol == 0:
         return False
     return last_closed_vol >= (avg * mult)
+
+
+# ---- Recent pump filter (reject SHORT after strong upward move) ----
+def check_recent_pump(df, direction, lookback=None, threshold=None):
+    if direction != 'SHORT':
+        return True
+    lookback = lookback if lookback is not None else RECENT_PUMP_LOOKBACK
+    threshold = threshold if threshold is not None else RECENT_PUMP_THRESHOLD
+    if df is None or len(df) < lookback + 1:
+        return True
+    base_price = df['close'].iloc[-lookback-1]
+    if base_price <= 0:
+        return True
+    recent_return = (df['close'].iloc[-1] - base_price) / base_price
+    if recent_return > threshold:
+        logger.info(f"  Recent pump detected ({recent_return*100:.2f}% in {lookback} candles), blocking SHORT")
+        return False
+    return True
+
+
+# ---- Funding rate check (reject SHORT if funding too negative) ----
+async def check_funding_rate(exchange, symbol, direction):
+    if direction != 'SHORT':
+        return True, None
+    try:
+        mapped = get_symbol_for_exchange(symbol, exchange.id)
+        funding = await exchange.fetch_funding_rate(mapped)
+        if funding is None:
+            return True, None
+        rate = funding.get('fundingRate')
+        if rate is None:
+            return True, None
+        rate = float(rate)
+        if rate < FUNDING_RATE_MIN:
+            logger.info(f"  Funding rate {rate*100:.4f}% < {FUNDING_RATE_MIN*100:.2f}% — short squeeze risk")
+            return False, rate
+        return True, rate
+    except Exception as e:
+        logger.warning(f"  Could not fetch funding for {symbol}: {e}")
+        return True, None
 
 
 def _round_price(p, ref_price):
@@ -881,7 +931,7 @@ def _is_in_cooldown(sym, cooldown_minutes):
 
 
 async def scan_market_single_run():
-    logger.info(f"Starting market scan (v3.3) | TUNING={TUNING}")
+    logger.info(f"Starting market scan (v3.4) | TUNING={TUNING}")
     sr_cache.clear()
     for eid, ex in exchanges.items():
         await _ensure_swap_options(ex, eid)
@@ -910,15 +960,15 @@ async def scan_market_single_run():
             df = calculate_indicators(df)
             df = normalize_features(df)
 
+            # --- Dynamic ADX threshold ---
             current_adx = float(df['adx'].iloc[-1]) if 'adx' in df.columns and not pd.isna(df['adx'].iloc[-1]) else 0.0
-            if current_adx < TUNING['MIN_ADX']:
-                logger.info(f"  Skipped {requested_symbol}: ADX {current_adx:.1f} < {TUNING['MIN_ADX']}")
-                continue
 
+            # --- Volume filter ---
             if not check_volume(df):
                 logger.info(f"  Skipped {requested_symbol}: low volume")
                 continue
 
+            # --- ML prediction ---
             prediction_sum, confidence = lorentzian_knn_predict(df)
             if confidence < TUNING['MIN_CONFIDENCE'] or abs(prediction_sum) < 2:
                 continue
@@ -926,14 +976,38 @@ async def scan_market_single_run():
             current_price = float(df['close'].iloc[-1])
             current_rsi = float(df['rsi'].iloc[-1]) if 'rsi' in df.columns else 50.0
             signal_type = 'LONG' if prediction_sum > 0 else 'SHORT'
+
+            # --- ADX gate (direction-aware) ---
+            min_adx_for_dir = TUNING['MIN_ADX_LONG'] if signal_type == 'LONG' else TUNING['MIN_ADX_SHORT']
+            if current_adx < min_adx_for_dir:
+                logger.info(f"  Skipped {requested_symbol} {signal_type}: ADX {current_adx:.1f} < {min_adx_for_dir}")
+                continue
+
+            # --- Emergency short disable ---
+            if signal_type == 'SHORT' and DISABLE_SHORTS:
+                logger.info(f"  Skipped {requested_symbol}: SHORT signals disabled")
+                continue
+
+            # --- RSI agreement ---
             rsi_agrees = (current_rsi < 72) if signal_type == 'LONG' else (current_rsi > 28)
             if not rsi_agrees:
                 continue
 
+            # --- HTF trend gate ---
             if not await check_htf_trend(exchange, resolved, signal_type):
                 logger.info(f"  Skipped {requested_symbol}: HTF trend mismatch")
                 continue
 
+            # --- Recent pump filter (SHORT only) ---
+            if not check_recent_pump(df, signal_type):
+                continue
+
+            # --- Funding rate filter (SHORT only) ---
+            fr_ok, funding_rate = await check_funding_rate(exchange, resolved, signal_type)
+            if not fr_ok:
+                continue
+
+            # --- S/R proximity ---
             cache_key = f"{requested_symbol}_{eid}"
             if cache_key not in sr_cache:
                 resist, support = await get_multi_timeframe_sr(exchange, resolved)
@@ -958,9 +1032,9 @@ async def scan_market_single_run():
 
             sl, tp1, tp2, tp3, leverage = result
 
-            # Cooldown check per symbol
+            # --- Cooldown check ---
             if _is_in_cooldown(requested_symbol, ALERT_COOLDOWN_MINUTES):
-                logger.info(f"  Cooldown active for {requested_symbol}, skipping alert")
+                logger.info(f"  Cooldown active for {requested_symbol}, skipping")
                 found_in_this_run.add(requested_symbol)
                 break
 
@@ -979,11 +1053,11 @@ async def scan_market_single_run():
                 'leverage': leverage,
                 'atr': atr,
                 'htf_ok': True,
+                'funding_rate': funding_rate,
             }
 
             logger.info(f"Signal confirmed & sent: {requested_symbol} {signal_type} conf={confidence:.2f} adx={current_adx:.1f}")
 
-            # Send IMMEDIATELY
             await format_and_send_signal(signal_data)
             await append_csv_row(CSV_LOG_PATH, SIGNAL_HEADER, {
                 'datetime_utc': now_iso,
@@ -1000,22 +1074,18 @@ async def scan_market_single_run():
                 'tp3': tp3,
                 'leverage': leverage,
                 'htf_ok': True,
+                'funding_rate': funding_rate if funding_rate is not None else '',
             })
 
             confirmed_list.append(signal_data)
             found_in_this_run.add(requested_symbol)
-
-            # Save cooldown marker in prev_signals
             prev_signals[requested_symbol] = {**signal_data, 'last_alert': now_iso}
-
-            break  # Move to next coin immediately
+            break
         await asyncio.sleep(0.08)
 
     await save_prev_signals()
-
     if not confirmed_list:
         logger.info("No confirmed signals")
-
     return confirmed_list
 
 
@@ -1023,7 +1093,9 @@ async def main():
     try:
         start_time = time.time()
         logger.info("=" * 50)
-        logger.info("SCANNER v3.3 — Single-pass confirmation (send on first signal)")
+        logger.info("SCANNER v3.4 — Short-squeeze protection enabled")
+        logger.info(f"  DISABLE_SHORTS={DISABLE_SHORTS} | MIN_ADX_LONG={TUNING['MIN_ADX_LONG']} | MIN_ADX_SHORT={TUNING['MIN_ADX_SHORT']}")
+        logger.info(f"  FUNDING_RATE_MIN={FUNDING_RATE_MIN*100:.3f}% | RECENT_PUMP={RECENT_PUMP_THRESHOLD*100:.1f}%/{RECENT_PUMP_LOOKBACK}c")
         await load_tuning()
         await load_prev_signals()
         await init_exchanges()
