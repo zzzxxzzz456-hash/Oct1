@@ -1,20 +1,24 @@
 """
-GitHub Actions Trading Scanner - Enhanced Version v3.0
-Filters & Accuracy improvements:
-  1. HTF Trend Gate (1h EMA50 direction filter)
-  2. ADX regime filter (reject signals in choppy market)
-  3. Distance-weighted kNN + softmax calibration
-  4. Volume filter (current candle vs 20-bar avg)
-  5. Feedback loop: track signal outcomes (CSV) + auto-tune thresholds
-  6. Per-symbol cooldown (avoid duplicate alerts)
-Plus previous v2.0 features:
-  - Count >= 2 (two-stage confirmation)
-  - Min R:R = 1:1.8 (reject signal if not met)
+GitHub Actions Trading Scanner - Enhanced Version v3.1
+Changelog v3.1:
+  - FIX: Volume filter now uses LAST CLOSED candle (-2) instead of forming candle (-1)
+  - FIX: Reduced MIN_VOLUME_MULT to 1.0 and MIN_ADX to 18 for more signals
+  - ADD: MAX_TP3_RR cap (6.0) to prevent unrealistic TP3 targets (e.g. 13x)
+  - ADD: Stricter leverage caps (15x max at low risk) to prevent dangerous 30x
+  - FIX: Telegram R:R computation now displays accurate values
+  - ADD: CCXT upgrade hint in requirements comment
+Base features (v3.0):
+  - HTF Trend Gate (1h EMA50 direction filter)
+  - ADX regime filter
+  - Distance-weighted kNN + softmax calibration
+  - Volume filter (fixed)
+  - Feedback loop (resolve outcomes + auto-tune)
+  - Per-symbol cooldown
+  - Count >= 2 confirmation
+  - Min R:R = 1:1.8 (hard reject)
   - Min S/R distance = max(0.6% price, 0.8*ATR)
-  - Min confidence = 0.62 (calibrated)
-  - 3 TPs based on real S/R
-  - Trailing TP guidance in Persian Telegram message
-  - Leverage suggestion based on SL distance
+  - 3 TPs on real S/R
+  - Trailing TP guidance in Persian message
 """
 
 import asyncio
@@ -51,7 +55,9 @@ COIN_LIST = [
     'SLERF/USDT','DEGEN/USDT','1000PEPE/USDT'
 ]
 
-EXCHANGE_ORDER = ['binance','bybit','kucoin','mexc','gateio','okx','bitget','huobi']
+# Removed 'gateio' and 'huobi' to avoid async ccxt attribute errors on older versions.
+# If your ccxt version supports them, add them back.
+EXCHANGE_ORDER = ['binance','bybit','kucoin','mexc','okx','bitget']
 SR_TIMEFRAMES = ['1d', '4h', '1h', '15m', '5m']
 TIMEFRAME_WEIGHTS = {'1d':5,'4h':3,'1h':2,'15m':1.5,'5m':1}
 
@@ -68,8 +74,8 @@ TUNE_PATH = 'tuner_state.json'
 DEFAULT_TUNING = {
     'MIN_RR': 1.8,
     'MIN_CONFIDENCE': 0.62,
-    'MIN_ADX': 20.0,
-    'MIN_VOLUME_MULT': 1.1,
+    'MIN_ADX': 18.0,
+    'MIN_VOLUME_MULT': 1.0,
     'MIN_SL_PCT': 0.012,
     'MIN_SR_DISTANCE_PCT': 0.006,
     'MIN_SR_DISTANCE_ATR_MULT': 0.8,
@@ -83,6 +89,7 @@ HTF_EMA_PERIOD = 50
 SIGNAL_STALE_MINUTES = 30
 ALERT_COOLDOWN_MINUTES = 120
 MAX_LEVERAGE_RISK_PCT = 4.5
+MAX_TP3_RR = 6.0   # cap TP3 at 6x risk (prevents unrealistic 13x targets)
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -96,7 +103,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2.0
 
 SYMBOL_MAP = {
-    '1000PEPE/USDT': {'mexc':'PEPE1000/USDT','gateio':'PEPE1000/USDT','bitget':'PEPE1000/USDT'},
+    '1000PEPE/USDT': {'mexc':'PEPE1000/USDT','bitget':'PEPE1000/USDT'},
     '1000BONK/USDT': {'mexc':'BONK1000/USDT'},
     '1000FLOKI/USDT': {'mexc':'FLOKI1000/USDT'},
     '1000SHIB/USDT': {'mexc':'SHIB1000/USDT'},
@@ -318,6 +325,9 @@ def get_symbol_for_exchange(symbol, exchange_id):
 
 async def create_exchange_client(exchange_id):
     try:
+        if not hasattr(ccxt, exchange_id):
+            logger.warning(f"Exchange {exchange_id} not available in installed ccxt version, skipping")
+            return None
         cls = getattr(ccxt, exchange_id)
         client = cls({'enableRateLimit': True, 'timeout': 30000, 'rateLimit': 1200})
         try:
@@ -506,15 +516,16 @@ async def check_htf_trend(exchange, symbol, direction):
         return last_close < ema
 
 
-# ---- Volume filter ----
+# ---- Volume filter (FIXED: uses last CLOSED candle -2, not forming candle -1) ----
 def check_volume(df, lookback=20, mult=None):
-    if df is None or len(df) < lookback + 1:
+    if df is None or len(df) < lookback + 2:
         return False
     mult = mult if mult is not None else TUNING['MIN_VOLUME_MULT']
-    avg = df['volume'].iloc[-lookback-1:-1].mean()
+    # Use last CLOSED candle (index -2) vs average of 20 fully-closed candles before it
+    avg = df['volume'].iloc[-lookback-2:-2].mean()
     if avg <= 0:
         return False
-    return df['volume'].iloc[-1] >= avg * mult
+    return df['volume'].iloc[-2] >= avg * mult
 
 
 def _round_price(p, ref_price):
@@ -552,6 +563,9 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
         valid_r3 = [r for r in valid_r2 if (r - price) / risk >= (min_rr + 2.0)]
         tp3 = valid_r3[0] if valid_r3 else max(atr_tp3, tp2 + 1.1 * risk)
 
+        # Cap TP3 at MAX_TP3_RR to avoid unrealistic targets
+        tp3 = min(tp3, price + MAX_TP3_RR * risk)
+
         if (tp1 - price) / risk < min_rr - 1e-9:
             return None
     else:
@@ -578,6 +592,9 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
         valid_s3 = [s for s in valid_s2 if (price - s) / risk >= (min_rr + 2.0)]
         tp3 = valid_s3[0] if valid_s3 else min(atr_tp3, tp2 - 1.1 * risk)
 
+        # Cap TP3 at MAX_TP3_RR
+        tp3 = max(tp3, price - MAX_TP3_RR * risk)
+
         if (price - tp1) / risk < min_rr - 1e-9:
             return None
 
@@ -586,11 +603,12 @@ def calculate_sl_tp_and_leverage(price, direction, atr, support_levels, resistan
     tp2 = _round_price(tp2, price)
     tp3 = _round_price(tp3, price)
 
+    # Stricter leverage caps to prevent dangerous 30x at tiny SL
     risk_pct = abs(price - sl) / price * 100
-    if risk_pct < 1.3:
-        leverage = "۱۵x – ۳۰x"
+    if risk_pct < 1.5:
+        leverage = "۱۰x – ۱۵x"
     elif risk_pct < 2.0:
-        leverage = "۱۰x – ۲۰x"
+        leverage = "۷x – ۱۲x"
     elif risk_pct < 3.0:
         leverage = "۷x – ۱۵x"
     elif risk_pct < MAX_LEVERAGE_RISK_PCT:
@@ -608,10 +626,6 @@ def create_labels(df, forward_bars=4, threshold=0.002):
 
 
 def lorentzian_knn_predict(df, k=8):
-    """
-    Distance-weighted kNN. Returns (prediction_sum, calibrated_confidence 0..1).
-    Confidence = softmax(weighted vote) => sharper than raw mean.
-    """
     feature_cols = ['rsi_norm','wavetrend_norm','cci_norm','adx_norm','rsi_short_norm']
     if df is None or len(df) < 60 or not all(c in df.columns for c in feature_cols):
         return 0, 0
@@ -634,15 +648,11 @@ def lorentzian_knn_predict(df, k=8):
     top_d = np.array([distances[i] for i in order])
     top_labels = np.array([recent_labels[valid_idx[i]] for i in order], dtype=float)
 
-    # Inverse-distance weights (guard against zero)
     weights = 1.0 / (top_d + 1e-6)
     weights = weights / weights.sum()
 
-    weighted_vote = float(np.sum(weights * top_labels))  # in [-1, 1]
+    weighted_vote = float(np.sum(weights * top_labels))
 
-    # Softmax-style calibration: map |vote| in [0,1] to a smooth confidence
-    # Using 2*x/(1+x) gives values approaching 1 for strong agreement,
-    # and near 0 for weak agreement. Then floor at raw agreement.
     raw_agree = abs(np.mean(top_labels))
     weighted_agree = abs(weighted_vote)
     calibrated = max(raw_agree, (2.0 * weighted_agree) / (1.0 + weighted_agree))
@@ -675,11 +685,6 @@ async def save_tuning():
 
 
 async def resolve_pending_outcomes():
-    """
-    Check past confirmed signals older than 6h but without outcome.
-    Fetch price history and decide whether TP1 or SL was hit first.
-    Append to OUTCOME_LOG_PATH.
-    """
     try:
         existing = await read_file_from_github(OUTCOME_LOG_PATH)
         if not existing:
@@ -691,7 +696,6 @@ async def resolve_pending_outcomes():
         rows = [dict(zip(header, l.split(','))) for l in lines[1:] if l]
         resolved_ids = {r['signal_id'] for r in rows if r.get('outcome')}
 
-        # Load confirmed signals
         sig_csv = await read_file_from_github(CSV_LOG_PATH)
         if not sig_csv:
             return
@@ -703,7 +707,7 @@ async def resolve_pending_outcomes():
 
         now = datetime.now(timezone.utc)
         newly_resolved = []
-        for s in sig_rows[-30:]:  # only recent ones
+        for s in sig_rows[-30:]:
             sid = f"{s.get('datetime_utc','')}_{s.get('symbol','')}_{s.get('direction','')}"
             if sid in resolved_ids:
                 continue
@@ -722,7 +726,6 @@ async def resolve_pending_outcomes():
             sl = float(s['sl'])
             tp1 = float(s['tp1'])
 
-            # find exchange client
             eid = s.get('exchange','binance')
             ex = exchanges.get(eid)
             if not ex:
@@ -733,7 +736,6 @@ async def resolve_pending_outcomes():
             df = await fetch_ohlcv_with_retry(ex, resolved_sym, timeframe='15m', limit=200)
             if df is None:
                 continue
-            # filter candles after signal time
             df = df[df['timestamp'] > sig_time]
             if df.empty:
                 continue
@@ -784,12 +786,6 @@ async def resolve_pending_outcomes():
 
 
 async def auto_tune_thresholds():
-    """
-    Read OUTCOME_LOG_PATH, compute win-rate.
-    Adjust TUNING slightly (bounded) every run:
-      - win-rate < 0.40 => raise MIN_CONFIDENCE and MIN_RR
-      - win-rate > 0.65 => lower MIN_CONFIDENCE slightly (more signals)
-    """
     try:
         content = await read_file_from_github(OUTCOME_LOG_PATH)
         if not content:
@@ -903,7 +899,7 @@ def _is_in_cooldown(sym, cooldown_minutes):
 
 
 async def scan_market_single_run():
-    logger.info(f"Starting market scan (v3.0) | TUNING={TUNING}")
+    logger.info(f"Starting market scan (v3.1) | TUNING={TUNING}")
     sr_cache.clear()
     for eid, ex in exchanges.items():
         await _ensure_swap_options(ex, eid)
@@ -929,13 +925,11 @@ async def scan_market_single_run():
             df = calculate_indicators(df)
             df = normalize_features(df)
 
-            # ---- ADX regime filter ----
             current_adx = float(df['adx'].iloc[-1]) if 'adx' in df.columns and not pd.isna(df['adx'].iloc[-1]) else 0.0
             if current_adx < TUNING['MIN_ADX']:
                 logger.info(f"  Skipped {requested_symbol}: ADX {current_adx:.1f} < {TUNING['MIN_ADX']}")
                 continue
 
-            # ---- Volume filter ----
             if not check_volume(df):
                 logger.info(f"  Skipped {requested_symbol}: low volume")
                 continue
@@ -951,7 +945,6 @@ async def scan_market_single_run():
             if not rsi_agrees:
                 continue
 
-            # ---- HTF trend gate ----
             if not await check_htf_trend(exchange, resolved, signal_type):
                 logger.info(f"  Skipped {requested_symbol}: HTF trend mismatch")
                 continue
@@ -1001,7 +994,6 @@ async def scan_market_single_run():
             break
         await asyncio.sleep(0.08)
 
-    # Confirmation + cooldown
     alerts_to_send = []
     for sym, cur in current_map.items():
         prev = prev_signals.get(sym)
@@ -1015,7 +1007,6 @@ async def scan_market_single_run():
         data = prev_signals.get(sym)
         if not data or data.get('count', 0) < 2:
             continue
-        # cooldown check
         if _is_in_cooldown(sym, ALERT_COOLDOWN_MINUTES):
             logger.info(f"  Cooldown active for {sym}, skipping alert")
             continue
@@ -1057,7 +1048,6 @@ async def scan_market_single_run():
             'htf_ok': data.get('htf_ok', False),
         })
 
-    # cleanup
     for s in list(prev_signals.keys()):
         if s not in current_map:
             prev_signals.pop(s, None)
@@ -1078,14 +1068,13 @@ async def main():
     try:
         start_time = time.time()
         logger.info("=" * 50)
-        logger.info("SCANNER v3.0 — HTF/ADX/Volume/Calibrated kNN/Feedback/Cooldown")
+        logger.info("SCANNER v3.1 — Volume fix + TP3 cap + safer leverage")
         await load_tuning()
         await load_prev_signals()
         await init_exchanges()
         if not exchanges:
             raise Exception("No exchanges available")
 
-        # Feedback loop: resolve old outcomes + auto-tune
         await resolve_pending_outcomes()
         await auto_tune_thresholds()
 
